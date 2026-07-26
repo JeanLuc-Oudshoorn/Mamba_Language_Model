@@ -12,9 +12,6 @@ import torch
 import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba3 import Mamba3
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.block import Block
@@ -52,15 +49,18 @@ def create_block(
         # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
-        ssm_layer_map = {
-            "Mamba1": Mamba,
-            "Mamba2": Mamba2,
-            "Mamba3": Mamba3,
-        }
-        if ssm_layer not in ssm_layer_map:
-            raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1, Mamba2, and Mamba3")
+        if ssm_layer == "Mamba1":
+            from mamba_ssm.modules.mamba_simple import Mamba as mixer_layer_cls
+        elif ssm_layer == "Mamba2":
+            from mamba_ssm.modules.mamba2 import Mamba2 as mixer_layer_cls
+        elif ssm_layer == "Mamba3":
+            from mamba_ssm.modules.mamba3 import Mamba3 as mixer_layer_cls
+        else:
+            raise ValueError(
+                f"Invalid ssm_layer: {ssm_layer}, only support Mamba1, Mamba2, and Mamba3"
+            )
         mixer_cls = partial(
-            ssm_layer_map[ssm_layer],
+            mixer_layer_cls,
             layer_idx=layer_idx,
             **ssm_cfg,
             **factory_kwargs

@@ -1,5 +1,9 @@
 *__pycache__/
 *.egg-info/
+.codex_tmp/
+.venv*/
+examples/adaptive_compression_example.png
+slides/_build/
 build/
 **.so
 *.hip
