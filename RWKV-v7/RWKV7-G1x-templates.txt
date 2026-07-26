@@ -1,0 +1,36 @@
+RWKV-7 G1-series trained templates
+
+Firstly, it's better to clean "System:" and "User:" inputs, using something like:
+
+def clean_txt(txt):
+    return re.sub(r'\n{2,}', '\n', txt.replace('\r\n','\n')).strip()
+
+And token id=0 means end_of_doc。Check https://huggingface.co/spaces/BlinkDL/RWKV-Gradio-1/blob/main/app.py for demo.
+
+Basic templates:
+
+"User: xxx\n\nAssistant:" 
+"User: xxx\n\nAssistant: xxx\n\nUser: xxx\n\nAssistant:"
+
+"System: xxx\n\nUser: xxx\n\nAssistant:"
+"System: xxx\n\nUser: xxx\n\nAssistant: xxx\n\nUser: xxx\n\nAssistant:"
+
+Think mode:
+
+"Assistant: <think"
+"Assistant: <think>\n</think" (fake thinking, nice results and fast)
+"Assistant: <think></think" (fake thinking, nice results and fast)
+
+Control think length (note: will use GPT-OSS style think)
+
+"User: xxx (think)\n\nAssistant: <think"
+"User: xxx (think a bit)\n\nAssistant: <think"
+"User: xxx (think a lot)\n\nAssistant: <think"
+
+Function call:
+
+"System: Tools:\n- get_weather(location: string, unit?: \"celsius\" | \"fahrenheit\")\n- get_stock_price(ticker: string)\n- translate_text(text: string, target_language: string)\nReturn only a JSON function call.\n\nUser: Translate \"Will it rain tomorrow?\" into Japanese.\n\nAssistant: ```json"
+
+"System: Tools:\n[\n{\"name\":\"find_free_slots\",\"description\":\"Find free calendar slots\",\"arguments\":{\"date\":{\"type\":\"string\"},\"duration_minutes\":{\"type\":\"integer\"},\"time_window\":{\"type\":\"string\"}}},\n{\"name\":\"create_calendar_event\",\"description\":\"Create a calendar event\",\"arguments\":{\"title\":{\"type\":\"string\"},\"start_time\":{\"type\":\"string\"},\"end_time\":{\"type\":\"string\"},\"attendees\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}\n]\nReturn only a JSON function call.\n\nUser: Schedule a 30-minute sync with Bob on 2026-05-08 afternoon.\n\nAssistant: ```json\n{\"name\":\"find_free_slots\",\"arguments\":{\"date\":\"2026-05-08\",\"duration_minutes\":30,\"time_window\":\"afternoon\"}}\n```\n\nUser: Function output:\n{\"free_slots\":[{\"start\":\"2026-05-08T15:00:00+09:00\",\"end\":\"2026-05-08T15:30:00+09:00\"}],\"bob_email\":\"bob@example.com\"}\n\nAssistant: ```json"
+
+The key is to keep it concise. Here you can enable "<think>" for Assistant too.
