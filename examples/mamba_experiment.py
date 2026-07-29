@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
@@ -15,8 +16,14 @@ import torch.nn.functional as F
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_DIR))
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from experiment_logging import ExperimentMetricsLogger
+
+
+PROJECT_ROOT = EXAMPLES_DIR.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 
 TRAIN_TOKEN_METADATA_PATH = (
@@ -1255,6 +1262,35 @@ def train_mamba_lm() -> None:
             seed=SEED,
         )
 
+    parameters = parameter_count(model)
+    metrics_logger = ExperimentMetricsLogger(
+        PROJECT_ROOT,
+        "mamba_experiment",
+        {
+            "block": BLOCK,
+            "model_dim": MODEL_DIM,
+            "layers": LAYERS,
+            "vocab_size": vocab_size,
+            "valid_vocab": valid_vocab,
+            "unit_name": unit_name,
+            "batch_size": BATCH_SIZE,
+            "context_length": CONTEXT_LENGTH,
+            "steps": STEPS,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "eval_batches": EVAL_BATCHES,
+            "log_interval": LOG_INTERVAL,
+            "checkpoint_interval": CHECKPOINT_INTERVAL,
+            "checkpoint_path": CHECKPOINT_PATH,
+            "resume_checkpoint_path": resume_checkpoint_path,
+            "train_token_metadata_path": TRAIN_TOKEN_METADATA_PATH,
+            "validation_source": validation_source,
+            "parameters": parameters,
+            "seed": SEED,
+        },
+    )
+    log(f"Metrics log: {metrics_logger.path}")
+
     print_training_configuration(
         train_data=train_data,
         validation_data=validation_data,
@@ -1285,6 +1321,18 @@ def train_mamba_lm() -> None:
     best_validation_loss = initial_loss
     best_step = resume_step
     last_validation_loss = initial_loss
+    metrics_logger.write_metrics(
+        run_step=0,
+        global_step=resume_step,
+        elapsed_seconds=0.0,
+        train_loss=None,
+        validation_loss=initial_loss,
+        perplexity=math.exp(min(initial_loss, 20)),
+        memory=memory_status(),
+        cuda_memory=cuda_memory_status(),
+        best_validation_loss=best_validation_loss,
+        best_step=best_step,
+    )
     completed_run_step = 0
     completed_global_step = resume_step
     early_stopping_enabled = EARLY_STOP_PATIENCE > 0
@@ -1358,11 +1406,12 @@ def train_mamba_lm() -> None:
             )
             last_validation_loss = validation_loss
             perplexity = math.exp(min(validation_loss, 20))
+            cuda_memory = cuda_memory_status()
             print(
                 f"step {run_step:>4}/{STEPS} "
                 f"(global {global_step:,}): train loss={loss.item():.4f}, "
                 f"validation loss={validation_loss:.4f}, "
-                f"perplexity={perplexity:.2f}, {cuda_memory_status()}",
+                f"perplexity={perplexity:.2f}, {cuda_memory}",
                 flush=True,
             )
             if validation_loss < best_validation_loss - EARLY_STOP_MIN_DELTA:
@@ -1386,7 +1435,20 @@ def train_mamba_lm() -> None:
                         flush=True,
                     )
                     stopped_early = True
-                    break
+            metrics_logger.write_metrics(
+                run_step=run_step,
+                global_step=global_step,
+                elapsed_seconds=time.perf_counter() - started,
+                train_loss=float(loss.detach().cpu()),
+                validation_loss=validation_loss,
+                perplexity=perplexity,
+                memory=memory_status(),
+                cuda_memory=cuda_memory,
+                best_validation_loss=best_validation_loss,
+                best_step=best_step,
+            )
+            if stopped_early:
+                break
 
         if (
             CHECKPOINT_INTERVAL > 0
@@ -1485,6 +1547,17 @@ def train_mamba_lm() -> None:
     )
     print("\nGenerated sample:\n", flush=True)
     print(sample, flush=True)
+    metrics_logger.write_event(
+        "run_complete",
+        completed_run_step=completed_run_step,
+        completed_global_step=completed_global_step,
+        elapsed_seconds=elapsed,
+        best_validation_loss=best_validation_loss,
+        best_step=best_step,
+        final_validation_loss=last_validation_loss,
+        checkpoint_path=checkpoint_path,
+    )
+    metrics_logger.close()
 
     _ = train_array, validation_array
 

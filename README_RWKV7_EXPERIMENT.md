@@ -17,29 +17,55 @@ but builds an RWKV-7 x070 model from `third_party/rwkv-lm/RWKV-v7/train_temp`.
 
 ## Environment
 
-Use the same WSL/PyCharm interpreter as the Mamba experiment:
+Use the project-local WSL virtual environment:
 
 ```powershell
-wsl -d Ubuntu-24.04 -- /home/stardustnuke/mamba-venv/bin/python
+wsl -d Ubuntu-24.04 -- "/mnt/e/PyCharm/PyCharm Community Edition 2022.2.3/Projects/Mamba/.venv-wsl/bin/python"
 ```
 
-RWKV-7 needs the official RWKV training dependencies. From inside the WSL
-environment, install the missing pieces if needed:
+RWKV-7 needs the official RWKV training dependencies plus a CUDA compiler for
+its extension build. Make sure these are installed in `.venv-wsl`:
 
-```bash
-/home/stardustnuke/mamba-venv/bin/python -m pip install pytorch-lightning==1.9.5 deepspeed ninja
+```text
+pytorch-lightning==1.9.5
+deepspeed
+wandb
+ninja
+nvidia-cuda-nvcc
+nvidia-cuda-runtime
+nvidia-cuda-cccl
 ```
 
 The vendored RWKV-7 implementation compiles CUDA extensions at import time. The
-first run can take a while, and it needs a CUDA toolkit compatible with your
-installed PyTorch build.
+first run can take a while. `examples/rwkv7_experiment.py` automatically points
+`CUDA_HOME` at the CUDA compiler bundled in `.venv-wsl` when it is available.
+When the project is under the default PyCharm path, the script uses no-space
+paths under `/tmp` for the CUDA toolkit and PyTorch's `torch/lib` directory
+because PyTorch writes those paths into Ninja without shell quoting. The CUDA
+path is a small build overlay, which also provides the unversioned
+`libcudart.so` linker name when the CUDA runtime wheel only ships
+`libcudart.so.13`.
+
+Even after the extensions are compiled, importing the vendored RWKV module runs
+Ninja cache checks and loads eight CUDA extensions. On the default `/mnt/e`
+workspace path this can still take several minutes before model initialization
+starts.
+
+If CUDA compilation fails with missing or incompatible toolkit headers, align
+the CUDA runtime and CCCL wheels with the WSL venv's `nvidia-cuda-nvcc`
+version. For the current `.venv-wsl` CUDA compiler, that is:
+
+```bash
+python -m pip install "nvidia-cuda-runtime==13.3.29"
+python -m pip install "nvidia-cuda-cccl==13.3.3.4.1"
+```
 
 ## Run
 
 From the repo root:
 
 ```powershell
-wsl -d Ubuntu-24.04 -- /home/stardustnuke/mamba-venv/bin/python examples/rwkv7_experiment.py
+wsl -d Ubuntu-24.04 -- "/mnt/e/PyCharm/PyCharm Community Edition 2022.2.3/Projects/Mamba/.venv-wsl/bin/python" examples/rwkv7_experiment.py
 ```
 
 The top-of-file settings mirror the Mamba script:

@@ -8,6 +8,8 @@ third_party/rwkv-lm/RWKV-v7/train_temp.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
+import hashlib
 import importlib
 import json
 import math
@@ -28,7 +30,7 @@ ENV_PATH = PROJECT_ROOT / ".env"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-from mamba_experiment import (  # noqa: E402
+from lm_experiment_utils import (  # noqa: E402
     ShuffledWindowSampler,
     apply_no_repeat_ngram,
     apply_repetition_penalty,
@@ -48,6 +50,7 @@ from mamba_experiment import (  # noqa: E402
     tokenizer_metadata,
     validate_tokenizer_match,
 )
+from experiment_logging import ExperimentMetricsLogger  # noqa: E402
 
 
 TRAIN_TOKEN_METADATA_PATH = (
@@ -63,11 +66,13 @@ CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "rwkv7_150m_lm.pt"
 RESUME_CHECKPOINT_PATH: Path | None = None
 
 MODEL_DIM = 768
-LAYERS = 12
+LAYERS = 10
 HEAD_SIZE = 64
 HEAD_CHUNK = 0
 RWKV_KERNEL = "@rwkv3"
 RWKV_PRECISION = "bf16"
+RWKV_INFERENCE_ONLY = False
+RWKV_PREFER_CACHED_EXTENSIONS = False
 PARAM_DTYPE = "bfloat16"
 AMP_DTYPE = "bfloat16"
 
@@ -110,9 +115,9 @@ def log(message: str) -> None:
 
 
 def autocast_context():
-    dtype = dtype_from_name(AMP_DTYPE)
-    enabled = dtype in {torch.float16, torch.bfloat16}
-    return torch.autocast("cuda", dtype=dtype, enabled=enabled)
+    # RWKV-7 bf16 kernels require bf16 activations; CUDA autocast promotes
+    # LayerNorm outputs to fp32 in this torch build.
+    return nullcontext()
 
 
 def checkpoint_metadata_path(checkpoint_path: Path) -> Path:
@@ -129,6 +134,7 @@ def tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(tensor_tree_to_cpu(item) for item in value)
     return value
+
 
 
 def copy_state_dict_to_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -181,6 +187,193 @@ def checkpoint_training_step(checkpoint: dict[str, object]) -> int:
     return int(checkpoint.get("step", 0))
 
 
+def prepend_env_path(name: str, path: Path) -> None:
+    path_value = str(path)
+    current = os.environ.get(name)
+    if not current:
+        os.environ[name] = path_value
+        return
+
+    entries = current.split(os.pathsep)
+    if path_value not in entries:
+        os.environ[name] = os.pathsep.join([path_value, *entries])
+
+
+def ninja_safe_overlay_root() -> Path:
+    override = os.environ.get("MAMBA_CPP_BUILD_OVERLAY_DIR")
+    candidates = [Path(override)] if override else []
+    if os.name == "posix":
+        candidates.append(Path.home() / ".cache" / "mamba_cpp_build_overlays")
+        candidates.append(Path("/tmp"))
+    else:
+        candidates.append(PROJECT_ROOT / ".cache" / "cpp_build_overlays")
+
+    for candidate in candidates:
+        if any(character.isspace() for character in str(candidate)):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        return candidate
+
+    raise RuntimeError(
+        "Could not create a no-space overlay directory for PyTorch/Ninja builds."
+    )
+
+
+def ninja_safe_build_path(path: Path, prefix: str, description: str) -> Path:
+    path = path.resolve()
+    if os.name != "posix" or not any(character.isspace() for character in str(path)):
+        return path
+
+    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+    link_path = ninja_safe_overlay_root() / f"{prefix}-{digest}"
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.resolve() == path:
+            return link_path
+        raise RuntimeError(
+            f"Cannot use {description}={path} because the path contains spaces "
+            f"and {link_path} already points somewhere else."
+        )
+
+    try:
+        link_path.symlink_to(path, target_is_directory=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot use {description}={path} because the path contains spaces "
+            "and creating a no-space symlink for PyTorch/Ninja failed. Move the "
+            "project to a path without spaces."
+        ) from exc
+    return link_path
+
+
+def ninja_safe_cuda_home(cuda_home: Path) -> Path:
+    cuda_home = cuda_home.resolve()
+    if os.name != "posix":
+        return cuda_home
+
+    has_spaces = any(character.isspace() for character in str(cuda_home))
+    needs_cudart_alias = (
+        not (cuda_home / "lib" / "libcudart.so").exists()
+        and any((cuda_home / "lib").glob("libcudart.so.*"))
+    )
+    if not has_spaces and not needs_cudart_alias:
+        return cuda_home
+
+    digest = hashlib.sha1(str(cuda_home).encode("utf-8")).hexdigest()[:12]
+    overlay_path = ninja_safe_overlay_root() / f"mamba-cuda-build-{digest}"
+    overlay_path.mkdir(parents=True, exist_ok=True)
+
+    for name in ("bin", "include", "nvvm"):
+        source = cuda_home / name
+        if source.exists():
+            ensure_symlink(overlay_path / name, source)
+
+    source_lib = cuda_home / "lib"
+    overlay_lib = overlay_path / "lib"
+    overlay_lib.mkdir(exist_ok=True)
+    for source in source_lib.iterdir():
+        ensure_symlink(overlay_lib / source.name, source)
+    ensure_versioned_library_alias(overlay_lib, "libcudart.so")
+    return overlay_path
+
+
+def ensure_symlink(link_path: Path, target_path: Path) -> None:
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.resolve() == target_path.resolve():
+            return
+        raise RuntimeError(
+            f"Cannot use {link_path} for the RWKV CUDA build because it already "
+            "points somewhere else."
+        )
+    link_path.symlink_to(target_path, target_is_directory=target_path.is_dir())
+
+
+def ensure_versioned_library_alias(lib_dir: Path, unversioned_name: str) -> None:
+    unversioned_path = lib_dir / unversioned_name
+    if unversioned_path.exists() or unversioned_path.is_symlink():
+        return
+
+    matches = sorted(lib_dir.glob(f"{unversioned_name}.*"))
+    if not matches:
+        return
+    unversioned_path.symlink_to(matches[-1])
+
+
+def ninja_safe_torch_lib_path(torch_lib_path: Path) -> Path:
+    return ninja_safe_build_path(
+        torch_lib_path,
+        "mamba-torch-lib",
+        "PyTorch library path",
+    )
+
+
+def require_cuda_cccl_headers(cuda_home: Path) -> None:
+    if (cuda_home / "include" / "nv" / "target").exists():
+        return
+
+    raise RuntimeError(
+        "CUDA CCCL headers are missing from the CUDA toolkit used for the RWKV "
+        f"extension build: {cuda_home / 'include' / 'nv' / 'target'} was not "
+        "found. Install a CUDA CCCL package matching the WSL venv's "
+        "nvidia-cuda-nvcc version."
+    )
+
+
+def configure_torch_cpp_extension_paths(cuda_home: Path) -> None:
+    import torch.utils.cpp_extension as cpp_extension
+
+    torch_lib_path = ninja_safe_torch_lib_path(Path(cpp_extension.TORCH_LIB_PATH))
+    cpp_extension.CUDA_HOME = str(cuda_home)
+    cpp_extension.TORCH_LIB_PATH = str(torch_lib_path)
+    prepend_env_path("LD_LIBRARY_PATH", torch_lib_path)
+
+
+def configure_cuda_home() -> None:
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home and (Path(cuda_home) / "bin" / "nvcc").exists():
+        cuda_home_path = ninja_safe_cuda_home(Path(cuda_home))
+        require_cuda_cccl_headers(cuda_home_path)
+        os.environ["CUDA_HOME"] = str(cuda_home_path)
+        prepend_env_path("PATH", cuda_home_path / "bin")
+        prepend_env_path("LD_LIBRARY_PATH", cuda_home_path / "lib")
+        configure_torch_cpp_extension_paths(cuda_home_path)
+        return
+
+    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        Path(sys.prefix)
+        / "lib"
+        / python_version
+        / "site-packages"
+        / "nvidia"
+        / "cu13",
+        PROJECT_ROOT
+        / ".venv-wsl"
+        / "lib"
+        / python_version
+        / "site-packages"
+        / "nvidia"
+        / "cu13",
+    ]
+    for candidate in candidates:
+        if (candidate / "bin" / "nvcc").exists():
+            cuda_home_path = ninja_safe_cuda_home(candidate)
+            require_cuda_cccl_headers(cuda_home_path)
+            os.environ["CUDA_HOME"] = str(cuda_home_path)
+            prepend_env_path("PATH", cuda_home_path / "bin")
+            prepend_env_path("LD_LIBRARY_PATH", cuda_home_path / "lib")
+            configure_torch_cpp_extension_paths(cuda_home_path)
+            return
+
+    raise RuntimeError(
+        "Could not find nvcc for the RWKV CUDA extension build. Install a CUDA "
+        "toolkit in the WSL venv or set CUDA_HOME to a toolkit directory that "
+        "contains bin/nvcc."
+    )
+
+
 def configure_rwkv_environment() -> None:
     if not RWKV_TRAIN_DIR.exists():
         raise FileNotFoundError(
@@ -201,6 +394,7 @@ def configure_rwkv_environment() -> None:
             "or set GRADIENT_CHECKPOINTING=False."
         )
 
+    configure_cuda_home()
     os.environ["RWKV_MY_TESTING"] = "x070"
     os.environ["RWKV_KERNEL"] = RWKV_KERNEL
     os.environ["RWKV_CTXLEN"] = str(CONTEXT_LENGTH)
@@ -208,6 +402,14 @@ def configure_rwkv_environment() -> None:
     os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(HEAD_CHUNK)
     os.environ["RWKV_FLOAT_MODE"] = RWKV_PRECISION
     os.environ["RWKV_JIT_ON"] = "0"
+    if RWKV_INFERENCE_ONLY:
+        os.environ["RWKV_INFERENCE_ONLY"] = "1"
+    else:
+        os.environ.pop("RWKV_INFERENCE_ONLY", None)
+    if RWKV_PREFER_CACHED_EXTENSIONS:
+        os.environ["RWKV_PREFER_CACHED_EXTENSIONS"] = "1"
+    else:
+        os.environ.pop("RWKV_PREFER_CACHED_EXTENSIONS", None)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -713,6 +915,7 @@ def print_training_configuration(
 def train_rwkv7_lm() -> None:
     load_env_file(ENV_PATH)
     require_cuda()
+    configure_rwkv_environment()
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     eval_generator = torch.Generator().manual_seed(SEED + 1)
@@ -726,9 +929,17 @@ def train_rwkv7_lm() -> None:
     if memory:
         log(f"Initial memory: {memory}")
 
+    log(
+        "Importing RWKV-7 module and loading CUDA extensions "
+        "(cached checks can take several minutes on /mnt paths)"
+    )
+    rwkv_module = import_rwkv_model_module()
+    log("RWKV-7 module imported")
+
     train_data, train_metadata, train_array = load_tokenized_corpus(
         TRAIN_TOKEN_METADATA_PATH,
         "train",
+        log_fn=log,
     )
     validation_array = None
     validation_metadata_path: Path | None = None
@@ -736,6 +947,7 @@ def train_rwkv7_lm() -> None:
         validation_data, validation_metadata, validation_array = load_tokenized_corpus(
             VALIDATION_TOKEN_METADATA_PATH,
             "validation",
+            log_fn=log,
         )
         validate_tokenizer_match(train_metadata, validation_metadata)
         validation_source = str(VALIDATION_TOKEN_METADATA_PATH)
@@ -764,6 +976,7 @@ def train_rwkv7_lm() -> None:
     tokenizer_meta = tokenizer_metadata(train_metadata)
     valid_vocab, unit_name, encode_prompt, decode_ids = build_generation_codec(
         tokenizer_meta,
+        log_fn=log,
     )
     vocab_size = int(train_metadata.get("vocab_size", valid_vocab))
     if vocab_size != valid_vocab:
@@ -772,7 +985,6 @@ def train_rwkv7_lm() -> None:
             f"size ({valid_vocab:,}); using metadata value for the model."
         )
 
-    rwkv_module = import_rwkv_model_module()
     rwkv_args = build_rwkv_args(vocab_size)
     model_config = rwkv_args_to_dict(rwkv_args)
     if resume_checkpoint_path is not None:
@@ -835,6 +1047,37 @@ def train_rwkv7_lm() -> None:
         )
 
     parameters = parameter_count(model)
+    metrics_logger = ExperimentMetricsLogger(
+        PROJECT_ROOT,
+        "rwkv7_experiment",
+        {
+            "model_dim": MODEL_DIM,
+            "layers": LAYERS,
+            "head_size": HEAD_SIZE,
+            "head_chunk": HEAD_CHUNK,
+            "rwkv_kernel": RWKV_KERNEL,
+            "rwkv_precision": RWKV_PRECISION,
+            "vocab_size": vocab_size,
+            "valid_vocab": valid_vocab,
+            "unit_name": unit_name,
+            "batch_size": BATCH_SIZE,
+            "context_length": CONTEXT_LENGTH,
+            "steps": STEPS,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "eval_batches": EVAL_BATCHES,
+            "log_interval": LOG_INTERVAL,
+            "checkpoint_interval": CHECKPOINT_INTERVAL,
+            "checkpoint_path": CHECKPOINT_PATH,
+            "resume_checkpoint_path": resume_checkpoint_path,
+            "train_token_metadata_path": TRAIN_TOKEN_METADATA_PATH,
+            "validation_source": validation_source,
+            "parameters": parameters,
+            "seed": SEED,
+        },
+    )
+    log(f"Metrics log: {metrics_logger.path}")
+
     print_training_configuration(
         train_data=train_data,
         validation_data=validation_data,
@@ -863,6 +1106,18 @@ def train_rwkv7_lm() -> None:
     best_validation_loss = initial_loss
     best_step = resume_step
     last_validation_loss = initial_loss
+    metrics_logger.write_metrics(
+        run_step=0,
+        global_step=resume_step,
+        elapsed_seconds=0.0,
+        train_loss=None,
+        validation_loss=initial_loss,
+        perplexity=math.exp(min(initial_loss, 20)),
+        memory=memory_status(),
+        cuda_memory=cuda_memory_status(),
+        best_validation_loss=best_validation_loss,
+        best_step=best_step,
+    )
     completed_run_step = 0
     completed_global_step = resume_step
     early_stopping_enabled = EARLY_STOP_PATIENCE > 0
@@ -935,11 +1190,12 @@ def train_rwkv7_lm() -> None:
             )
             last_validation_loss = validation_loss
             perplexity = math.exp(min(validation_loss, 20))
+            cuda_memory = cuda_memory_status()
             print(
                 f"step {run_step:>4}/{STEPS} "
                 f"(global {global_step:,}): train loss={loss.item():.4f}, "
                 f"validation loss={validation_loss:.4f}, "
-                f"perplexity={perplexity:.2f}, {cuda_memory_status()}",
+                f"perplexity={perplexity:.2f}, {cuda_memory}",
                 flush=True,
             )
             if validation_loss < best_validation_loss - EARLY_STOP_MIN_DELTA:
@@ -963,7 +1219,20 @@ def train_rwkv7_lm() -> None:
                         flush=True,
                     )
                     stopped_early = True
-                    break
+            metrics_logger.write_metrics(
+                run_step=run_step,
+                global_step=global_step,
+                elapsed_seconds=time.perf_counter() - started,
+                train_loss=float(loss.detach().cpu()),
+                validation_loss=validation_loss,
+                perplexity=perplexity,
+                memory=memory_status(),
+                cuda_memory=cuda_memory,
+                best_validation_loss=best_validation_loss,
+                best_step=best_step,
+            )
+            if stopped_early:
+                break
 
         if (
             CHECKPOINT_INTERVAL > 0
@@ -1047,6 +1316,17 @@ def train_rwkv7_lm() -> None:
     )
     print("\nGenerated sample:\n", flush=True)
     print(sample, flush=True)
+    metrics_logger.write_event(
+        "run_complete",
+        completed_run_step=completed_run_step,
+        completed_global_step=completed_global_step,
+        elapsed_seconds=elapsed,
+        best_validation_loss=best_validation_loss,
+        best_step=best_step,
+        final_validation_loss=last_validation_loss,
+        checkpoint_path=checkpoint_path,
+    )
+    metrics_logger.close()
 
     _ = train_array, validation_array
 

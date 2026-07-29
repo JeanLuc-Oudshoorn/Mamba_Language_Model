@@ -6,12 +6,27 @@ import os, sys, math, gc, importlib
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
-from pytorch_lightning.strategies import DeepSpeedStrategy
-if importlib.util.find_spec('deepspeed'):
-    import deepspeed
-    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+RWKV_INFERENCE_ONLY = os.environ.get("RWKV_INFERENCE_ONLY") == "1"
+if RWKV_INFERENCE_ONLY:
+    _LightningModule = nn.Module
+
+    def rank_zero_info(*args, **kwargs):
+        return None
+
+    def rank_zero_only(fn):
+        return fn
+
+    class DeepSpeedStrategy:
+        pass
+else:
+    import pytorch_lightning as pl
+    from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+    from pytorch_lightning.strategies import DeepSpeedStrategy
+
+    _LightningModule = pl.LightningModule
+    if importlib.util.find_spec('deepspeed'):
+        import deepspeed
+        from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -38,6 +53,36 @@ if os.environ["RWKV_JIT_ON"] == "1":
 
 from torch.utils.cpp_extension import load
 
+def _cached_extension_library_path(name):
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+    except Exception:
+        return None
+
+    library_path = os.path.join(_get_build_directory(name, verbose=False), f"{name}.so")
+    if os.path.exists(library_path):
+        return library_path
+    return None
+
+
+def _load_extension(name, sources, **kwargs):
+    if (
+        os.environ.get("RWKV_PREFER_CACHED_EXTENSIONS") == "1"
+        and kwargs.get("is_python_module", True) is False
+    ):
+        library_path = _cached_extension_library_path(name)
+        if library_path is not None:
+            try:
+                torch.ops.load_library(library_path)
+                if os.environ.get("RWKV_EXTENSION_VERBOSE") == "1":
+                    print(f"Loaded cached RWKV CUDA extension {name}: {library_path}")
+                return None
+            except OSError as exc:
+                if os.environ.get("RWKV_EXTENSION_VERBOSE") == "1":
+                    print(f"Could not load cached RWKV CUDA extension {name}: {exc}")
+
+    return load(name=name, sources=sources, **kwargs)
+
 HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
 
 if 'x070' in os.environ["RWKV_MY_TESTING"]:
@@ -52,10 +97,10 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
     flags = ['-res-usage', f'-D_N_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
     if "@rwkv3" in os.environ["RWKV_KERNEL"]:
         RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw_v3
-        load(name="rwkv7_clampw_v3", sources=['cuda/rwkv7_clampw_v3_for_h100.cu', 'cuda/rwkv7_clampw_v3.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+        _load_extension(name="rwkv7_clampw_v3", sources=['cuda/rwkv7_clampw_v3_for_h100.cu', 'cuda/rwkv7_clampw_v3.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
     else:
         RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw
-        load(name="rwkv7_clampw", sources=['cuda/rwkv7_clampw.cu', 'cuda/rwkv7_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+        _load_extension(name="rwkv7_clampw", sources=['cuda/rwkv7_clampw.cu', 'cuda/rwkv7_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
     class RWKV7_CLAMPW_CUDA_OP(torch.autograd.Function):
         @staticmethod
         def forward(ctx,r,w,k,v,a,b):
@@ -84,7 +129,7 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
 
 ########################################################################################################
 
-load(name="rwkv7_cmix_bf16_v5", sources=["cuda/rwkv7_cmix_bf16_v5.cpp","cuda/rwkv7_cmix_bf16_v5.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_cmix_bf16_v5", sources=["cuda/rwkv7_cmix_bf16_v5.cpp","cuda/rwkv7_cmix_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -116,7 +161,7 @@ class _CmixLayerV2Fn(torch.autograd.Function):
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_mix6_bf16_v5", sources=["cuda/rwkv7_tmix_mix6_bf16_v5.cpp","cuda/rwkv7_tmix_mix6_bf16_v5.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_tmix_mix6_bf16_v5", sources=["cuda/rwkv7_tmix_mix6_bf16_v5.cpp","cuda/rwkv7_tmix_mix6_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -154,6 +199,8 @@ def _forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
         x_g.contiguous(),
     )
 
+_tmix_mix6_bf16_v5_forward_op = _forward_op
+
 @torch.jit.script
 def _tmix_mix6_bf16_v5_jit(
     x: torch.Tensor,
@@ -172,11 +219,11 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
-        return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+        return tuple(_tmix_mix6_bf16_v5_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_kk_pre_bf16_v5", sources=["cuda/rwkv7_tmix_kk_pre_bf16_v5.cpp","cuda/rwkv7_tmix_kk_pre_bf16_v5.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_tmix_kk_pre_bf16_v5", sources=["cuda/rwkv7_tmix_kk_pre_bf16_v5.cpp","cuda/rwkv7_tmix_kk_pre_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -221,6 +268,8 @@ def _forward_op(k, k_k, a, k_a):
     )
     return outs[0], outs[1], outs[2]
 
+_tmix_kk_pre_bf16_v5_forward_op = _forward_op
+
 @torch.jit.script
 def _tmix_kk_pre_bf16_v5_jit(
     k: torch.Tensor,
@@ -242,11 +291,11 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_kk_pre_bf16_v5_jit(k, k_k, a, k_a)
 else:
     def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
-        return tuple(_forward_op(k, k_k, a, k_a))
+        return tuple(_tmix_kk_pre_bf16_v5_forward_op(k, k_k, a, k_a))
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_lnx_rkvres_xg_bf16_v1", sources=["cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cpp","cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_tmix_lnx_rkvres_xg_bf16_v1", sources=["cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cpp","cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -292,6 +341,8 @@ def _forward_op(x, r, k, v, r_k, weight, bias, g):
     )
     return outs[0]
 
+_tmix_lnx_rkvres_xg_bf16_v1_forward_op = _forward_op
+
 @torch.jit.script
 def _tmix_lnx_rkvres_xg_bf16_v1_jit(
     x: torch.Tensor,
@@ -320,11 +371,11 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_lnx_rkvres_xg_bf16_v1_jit(x, r, k, v, r_k, weight, bias, g)
 else:
     def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
-        return _forward_op(x, r, k, v, r_k, weight, bias, g)
+        return _tmix_lnx_rkvres_xg_bf16_v1_forward_op(x, r, k, v, r_k, weight, bias, g)
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_a_gate_bf16", sources=["cuda/rwkv7_tmix_a_gate_bf16.cpp","cuda/rwkv7_tmix_a_gate_bf16.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_tmix_a_gate_bf16", sources=["cuda/rwkv7_tmix_a_gate_bf16.cpp","cuda/rwkv7_tmix_a_gate_bf16.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -353,6 +404,8 @@ def _forward_op(a0, a12):
         a12.contiguous(),
     )
 
+_tmix_a_gate_bf16_forward_op = _forward_op
+
 @torch.jit.script
 def _tmix_a_gate_bf16_jit(
     a0: torch.Tensor,
@@ -368,11 +421,11 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_a_gate_bf16_jit(a0, a12)
 else:
     def tmix_a_gate_bf16(a0, a12):
-        return _forward_op(a0, a12)
+        return _tmix_a_gate_bf16_forward_op(a0, a12)
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_vres_gate_bf16_v3", sources=["cuda/rwkv7_tmix_vres_gate_bf16_v3.cpp","cuda/rwkv7_tmix_vres_gate_bf16_v3.cu"], extra_cflags=["-O3"],
+_load_extension(name="rwkv7_tmix_vres_gate_bf16_v3", sources=["cuda/rwkv7_tmix_vres_gate_bf16_v3.cpp","cuda/rwkv7_tmix_vres_gate_bf16_v3.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -405,6 +458,8 @@ def _forward_op(v, v_first, v0, v12):
         v12.contiguous(),
     )
 
+_tmix_vres_gate_bf16_v3_forward_op = _forward_op
+
 @torch.jit.script
 def _tmix_vres_gate_bf16_v3_jit(
     v: torch.Tensor,
@@ -424,13 +479,16 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_vres_gate_bf16_v3_jit(v, v_first, v0, v12)
 else:
     def tmix_vres_gate_bf16_v3(v, v_first, v0, v12):
-        return _forward_op(v, v_first, v0, v12)
+        return _tmix_vres_gate_bf16_v3_forward_op(v, v_first, v0, v12)
 
 ########################################################################################################
 
-L2WRAP_CE_CUDA_V2 = load(name="rwkv7_l2wrap_ce_bf16_v2", sources=["cuda/rwkv7_l2wrap_ce_bf16_v2.cpp","cuda/rwkv7_l2wrap_ce_bf16_v2.cu"], extra_cflags=["-O3"],
-     extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
-     verbose=True)
+if os.environ.get("RWKV_INFERENCE_ONLY") == "1":
+    L2WRAP_CE_CUDA_V2 = None
+else:
+    L2WRAP_CE_CUDA_V2 = _load_extension(name="rwkv7_l2wrap_ce_bf16_v2", sources=["cuda/rwkv7_l2wrap_ce_bf16_v2.cpp","cuda/rwkv7_l2wrap_ce_bf16_v2.cu"], extra_cflags=["-O3"],
+         extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
+         verbose=True)
 
 class L2WrapCrossEntropyCUDA(torch.autograd.Function):
     @staticmethod
@@ -455,13 +513,15 @@ class L2WrapCrossEntropyCUDA(torch.autograd.Function):
         return grad_logits, None
 
 def l2wrap_cross_entropy(logits, targets):
+    if L2WRAP_CE_CUDA_V2 is None:
+        raise RuntimeError("RWKV l2wrap cross entropy is unavailable in inference-only mode.")
     return L2WrapCrossEntropyCUDA.apply(logits, targets)
 
 ########################################################################################################
 
 if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
     HEAD_L2WRAP_CE_CHUNK = int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"])
-    HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
+    HEAD_L2WRAP_CE_CUDA_V4 = _load_extension(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
          extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
          verbose=True)
 
@@ -575,10 +635,11 @@ class RWKV_Tmix_x070(MyModule):
             self.output = nn.Linear(C, C, bias=False)
             self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
 
-            self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
-            self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            self.output.weight.data.zero_()
+            if not RWKV_INFERENCE_ONLY:
+                self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+                self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
+                self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+                self.output.weight.data.zero_()
 
     @MyFunction
     def forward(self, x, v_first):
@@ -719,8 +780,9 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
 
-        self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
-        self.value.weight.data.zero_()
+        if not RWKV_INFERENCE_ONLY:
+            self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
+            self.value.weight.data.zero_()
 
     def forward(self, x):
         return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
@@ -771,7 +833,7 @@ class Block(nn.Module):
 #         return (grad_output, grad_output * gy) # original (grad_output, gy) is buggy when grad_output != 1 !!!
 
 
-class RWKV(pl.LightningModule):
+class RWKV(_LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
